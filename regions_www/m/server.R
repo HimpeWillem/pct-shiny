@@ -40,7 +40,6 @@ lsoa_legend_df <- data.frame(
   labels = c( "1-9", "10-49", "50-99", "100-249", "250-499", "500-999", "1000-1999", "2000+" )
 )
 
-
 if(!on_server){
   source(file.path(shiny_root, "scripts", "init.R"))
   init_dev_env(data_dir_root, data_sha, c(available_locally_pkgs, must_be_installed_pkgs), shiny_root)
@@ -62,7 +61,8 @@ lapply(available_locally_pkgs, library, character.only = T)
 source(file.path(shiny_root, "pct-shiny-funs.R"), local = T)
 
 # Static files
-regions <- rgdal::readOGR(dsn = file.path(shiny_root, "regions_www/regions.geojson"), layer = "OGRGeoJSON")
+regions <- readRDS(file.path(shiny_root, "regions_www/regions-highres.Rds"))
+regions$Region <- as.character(regions$Region)
 regions <- spTransform(regions, CRS("+init=epsg:4326 +proj=longlat"))
 codebook_l = readr::read_csv(file.path(shiny_root, "static", "codebook_lines.csv"))
 codebook_z = readr::read_csv(file.path(shiny_root, "static", "codebook_zones.csv"))
@@ -113,8 +113,10 @@ shinyServer(function(input, output, session){
     to_plot$quieter_route@data$rqincr <<- to_plot$quieter_route@data$length / to_plot$faster_route@data$length
 
     region$all_trips <- dir.exists(file.path(data_dir_root, region$current , 'all-trips'))
-
+    # Identify the centre of the current region
+    to_plot$center_dim <<- rgeos::gCentroid(regions[regions$Region == region$current,], byid = TRUE)@coords
     region$repopulate_region <- T
+
   })
 
   region <- reactiveValues(current = NA, data_dir = NA, repopulate_region = F, all_trips = NA)
@@ -208,7 +210,7 @@ shinyServer(function(input, output, session){
       poly <- flows_bb()
       if(is.null(poly)) return(NULL)
       poly <- spTransform(poly, CRS(proj4string(lines)))
-      keep <- rgeos::gContains(poly, lines,byid=TRUE )
+      keep <- rgeos::gIntersects(poly, lines,byid=TRUE )
       if(all(!keep)) return(NULL)
       lines_in_bb <- lines[drop(keep), ]
       # Sort by the absolute values
@@ -219,23 +221,15 @@ shinyServer(function(input, output, session){
       nos <- nos / 100 * nrow(lines)
       lines[ tail(order(abs(lines[[line_data()]])), nos), ]
     }
-
   }
 
-  # Finds the Local Authority shown inside the map bounds
-  find_region <- function(current_region){
-    bb <- map_bb()
-    if(is.null(bb)) return(NULL)
-    regions_bb_intersects <- rgeos::gIntersects(bb, regions, byid=T)
-    # return NULL if centre is outside the shapefile
-    if(all(drop(!regions_bb_intersects))) return(NULL)
-
-    current_region_visible <- current_region %in% tolower(regions[drop(regions_bb_intersects), ]$Region)
-    if(current_region_visible) return(NULL)
-
-    regions_map_center_in <- rgeos::gContains(regions, rgeos::gCentroid(bb, byid=T), byid=T)
-    if(all(drop(!regions_map_center_in))) return(NULL)
-    tolower(regions[drop(regions_map_center_in), ]$Region[1])
+  find_region <- function(lng, lat, current_region){
+    if(is.null(lng) || is.null(lat)) return(NULL)
+    point <- SpatialPoints(cbind(lng, lat), proj4string=CRS("+init=epsg:4326 +proj=longlat"))
+    lat_lng_region_bool <- rgeos::gContains(regions, point, byid=T)
+    lat_lng_region <- regions[drop(lat_lng_region_bool), ]$Region[1]
+    if(is.na(lat_lng_region) || tolower(lat_lng_region) == current_region) return(NULL)
+    lat_lng_region
   }
 
   attrs_zone <- c("Scenario Level of Cycling (SLC)" =    "slc",
@@ -253,11 +247,31 @@ shinyServer(function(input, output, session){
     })
   })
 
-  observe({ # For highlighting the clicked line
+  observeEvent(input$map_shape_click, { # For highlighting the clicked line
     event <- input$map_shape_click
     if (is.null(event) || event$id == "highlighted")
       return()
-    e_lat_lng <- paste0(event$lat,event$lng)
+    # Check if the event$id is called from the "new_region" polygons
+    if(grepl("new_region", event$id)){
+      # Split the id to identify the region name
+      new_region <- strsplit(event$id, " ")[[1]][2]
+      if(is.null(new_region)) return()
+      new_region_all_trips <- dir.exists(file.path(data_dir_root, new_region , 'all-trips'))
+      # Check if the new_region is not null, and contains 'all-trips' subfolder
+      new_data_dir <- ifelse (new_region_all_trips,
+                              file.path(data_dir_root, new_region, 'all-trips'),
+                              file.path(data_dir_root, new_region))
+
+      if(region$data_dir != new_data_dir && file.exists(new_data_dir)){
+        region$current <- new_region
+        region$data_dir <- new_data_dir
+        region$repopulate_region <- F
+        if(input$freeze) # If we change the map data then lines should not be frozen to the old map data
+          updateCheckboxInput(session, "freeze", value = F)
+      }
+      return()
+    }
+    e_lat_lng <- paste0(event$lat, event$lng)
 
     # Fix bug when a line has been clicked then the click event is
     # re-emmited when the map is moved
@@ -291,27 +305,6 @@ shinyServer(function(input, output, session){
     })
   })
 
-  # Updates the Local Authority if the map is moved
-  # over another region with data
-  observe({
-    new_region <- find_region(region$current)
-    if(is.null(new_region)) return()
-
-    new_region_all_trips <- dir.exists(file.path(data_dir_root, new_region , 'all-trips'))
-    # Check if the new_region is not null, and contains 'all-trips' subfolder
-    new_data_dir <- ifelse (new_region_all_trips,
-                            file.path(data_dir_root, new_region, 'all-trips'),
-                            file.path(data_dir_root, new_region))
-
-    if(region$data_dir != new_data_dir && file.exists(new_data_dir) && !file.exists(file.path(new_data_dir, 'isolated'))){
-      region$current <- new_region
-      region$data_dir <- new_data_dir
-      region$repopulate_region <- F
-      if(input$freeze) # If we change the map data then lines should not be frozen to the old map data
-        updateCheckboxInput(session, "freeze", value = F)
-    }
-  })
-
   # Plot if lines change
   observe({
     # Needed to force lines to be redrawn when scenario, zone or base map changes
@@ -321,16 +314,17 @@ shinyServer(function(input, output, session){
     input$show_zones
     region$repopulate_region
 
-    leafletProxy("map")  %>% clearGroup(., c("straight_line", "quieter_route", "faster_route", "route_network")) %>%
-      removeShape(., "highlighted")
+    line_type <- ifelse(input$line_type == 'routes', "quieter_route", input$line_type)
+    local_lines <- sort_lines(to_plot[[line_type]], input$line_type, input$nos_lines)
 
-    if(input$line_type == 'routes') {
-      to_plot$ldata <<- sort_lines(to_plot$faster_route, input$line_type, input$nos_lines)
-      plot_lines(leafletProxy("map"), sort_lines(to_plot$quieter_route, input$line_type, input$nos_lines), "quieter_route")
-      plot_lines(leafletProxy("map"), to_plot$ldata, "faster_route")
-    } else {
-      to_plot$ldata <<- sort_lines(to_plot[[input$line_type]], input$line_type, input$nos_lines)
-      plot_lines(leafletProxy("map"), to_plot$ldata, input$line_type)
+    if (is.null(to_plot$ldata) || (!is.null(to_plot$ldata) && !identical(to_plot$ldata, local_lines))){
+      leafletProxy("map")  %>% clearGroup(., c("straight_line", "quieter_route", "faster_route", "route_network")) %>%
+        removeShape(., "highlighted")
+      to_plot$ldata <<- local_lines
+      plot_lines(leafletProxy("map"), to_plot$ldata, line_type)
+      if(input$line_type == 'routes') {
+        plot_lines(leafletProxy("map"), sort_lines(to_plot$faster_route, "faster_route", input$nos_lines), "faster_route")
+      }
     }
 
     if(input$line_type == 'route_network')
@@ -364,7 +358,7 @@ shinyServer(function(input, output, session){
 
     clearGroup(leafletProxy("map"), c("zones", "centres"))
     if(input$show_zones) {
-      show_zone_popup <- input$line_type %in% show_no_lines
+      show_zone_popup <- line_type %in% show_no_lines
       popup <- if(show_zone_popup) zone_popup(to_plot$zones, input$scenario, zone_attr(), showing_all_trips())
       addPolygons(leafletProxy("map"),  data = to_plot$zones,
                   weight = 2,
@@ -387,6 +381,7 @@ shinyServer(function(input, output, session){
     leafletProxy("map") %>% hideGroup(., "centres") %>%
     {
       if(!line_type %in% show_no_lines) {
+
         switch(line_type,
                'routes'= {
                  hideGroup(., c("quieter_route", "faster_route") ) %>% showGroup(., c("quieter_route", "faster_route"))
@@ -516,13 +511,15 @@ shinyServer(function(input, output, session){
            'roadmap' = "http://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png",
            'satellite' = "http://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
            'IMD' =  "http://tiles.oobrien.com/imd2015_eng/{z}/{x}/{y}.png",
-           'opencyclemap' = "https://c.tile.thunderforest.com/cycle/{z}/{x}/{y}.png",
+           'opencyclemap' = "https://{s}.tile.thunderforest.com/cycle/{z}/{x}/{y}.png?apikey=feae177da543411c9efa64160305212d",
            'hilliness' = "http://server.arcgisonline.com/ArcGIS/rest/services/World_Shaded_Relief/MapServer/tile/{z}/{y}/{x}"
     )
   })
 
   observe({
     input$map_base
+    region$repopulate_region
+
     if (input$line_type == "lsoa_base_map"){
       urlTemplate <- paste0("http://npttile.vs.mythic-beasts.com/", input$scenario, "/{z}/{x}/{y}.png")
 
@@ -537,6 +534,33 @@ shinyServer(function(input, output, session){
     } else {
       leafletProxy("map") %>% removeTiles(., layerId = "lsoa_base_map") %>% removeControl("lsoa_leg")
     }
+  })
+
+  observe({
+    input$map_base
+    region$repopulate_region
+
+    #Redraw zone polygons when regions is switched, as the current region should not be highlighted
+
+    #Remove old regions polygons
+    leafletProxy("map") %>% clearGroup(., "regions-zones")
+
+    ## Add all regions boundary in the beginning but set its opacity to a minimum
+    addPolygons(leafletProxy("map"),
+                data = regions[regions$Region != region$current,], weight = 0.1,
+                color = "#000000",
+                fillColor = "aliceblue",
+                fillOpacity = 0.01,
+                opacity = 0.3,
+                label = paste("Click to view", get_pretty_region_name(regions[regions$Region != region$current,]$Region)),
+                labelOptions = labelOptions(direction = 'auto'),
+                # On highlight widen the boundary and fill the polygons
+                highlightOptions = highlightOptions(
+                  color='grey', opacity = 0.3, weight = 10, fillOpacity = 0.6,
+                  bringToFront = TRUE, sendToBack = TRUE),
+                options = pathOptions(clickable = T),
+                layerId = paste("new_region", regions[regions$Region != region$current,]$Region),
+                group = "regions-zones")
   })
 
   # Set map attributes
@@ -588,26 +612,35 @@ shinyServer(function(input, output, session){
   })
 
   # Initialize the leaflet map
-  output$map = renderLeaflet(
+  output$map <- renderLeaflet(
     leaflet() %>%
-      addTiles(., urlTemplate = map_tile_url(),
-               attribution = '<a target="_blank" href="http://shiny.rstudio.com/">Shiny</a> |
-               Routing <a target="_blank" href ="https://www.cyclestreets.net">CycleStreets</a> |
-               Map &copy <a target="_blank" href ="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
-               options=tileOptions(opacity = ifelse(input$map_base == "IMD", 0.3, 1),
-                                   minZoom = 7,
-                                   maxZoom = ifelse(input$map_base == "IMD", 14, 18), reuseTiles = T)) %>%
-                                   {
-                                     if (input$map_base == 'IMD'){
-                                       addTiles(., urlTemplate = "http://tiles.oobrien.com/shine_urbanmask_dark/{z}/{x}/{y}.png",
-                                                options=tileOptions(opacity = 0.3, minZoom = 7, maxZoom = 14, reuseTiles = T))
-                                       addTiles(., urlTemplate = "http://tiles.oobrien.com/shine_labels_cdrc/{z}/{x}/{y}.png",
-                                                options=tileOptions(opacity = 0.3, minZoom = 7, maxZoom = 14, reuseTiles = T))
-                                     }else .
-                                   } %>%
       addCircleMarkers(., data = to_plot$cents, radius = 0, group = "centres", opacity = 0.0) %>%
-      mapOptions(zoomToLimits = "first")
+      setView(., lng = to_plot$center_dim[1, 1], lat = to_plot$center_dim[1, 2], zoom = 10) %>%
+      mapOptions(zoomToLimits = "never")
   )
+
+
+  observe({
+    input$map_base
+    region$current
+
+    addTiles(leafletProxy("map"), urlTemplate = map_tile_url(),
+             attribution = '<a target="_blank" href="http://shiny.rstudio.com/">Shiny</a> |
+             Routing <a target="_blank" href ="https://www.cyclestreets.net">CycleStreets</a> |
+             Map &copy <a target="_blank" href ="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+             options=tileOptions(opacity = ifelse(input$map_base == "IMD", 0.3, 1),
+                                 minZoom = 7,
+                                 maxZoom = ifelse(input$map_base == "IMD", 14, 18), reuseTiles = T)) %>%
+                                 {
+                                   if (input$map_base == 'IMD'){
+                                     addTiles(leafletProxy("map"), urlTemplate = "http://tiles.oobrien.com/shine_urbanmask_dark/{z}/{x}/{y}.png",
+                                              options=tileOptions(opacity = 0.3, minZoom = 7, maxZoom = 14, reuseTiles = T))
+                                     addTiles(leafletProxy("map"), urlTemplate = "http://tiles.oobrien.com/shine_labels_cdrc/{z}/{x}/{y}.png",
+                                              options=tileOptions(opacity = 0.3, minZoom = 7, maxZoom = 14, reuseTiles = T))
+                                   }else .
+                                 }
+
+  })
 
   # Adds map legend
   observe({
