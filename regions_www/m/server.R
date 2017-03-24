@@ -517,14 +517,13 @@ shinyServer(function(input, output, session){
   })
 
   observe({
-    input$map_base
     region$repopulate_region
 
     if (input$line_type == "lsoa_base_map"){
       urlTemplate <- paste0("http://npttile.vs.mythic-beasts.com/", input$scenario, "/{z}/{x}/{y}.png")
 
       leafletProxy("map") %>%
-        addTiles(., urlTemplate = urlTemplate, layerId = "lsoa_base_map",
+        addTiles(., urlTemplate = urlTemplate, layerId = "lsoa_base_map", group = "lsoa_base_map",
                  options=tileOptions(maxNativeZoom = 13, reuseTiles = T, tms = T)) %>%
         addLegend("topleft", layerId= "lsoa_leg", colors = lsoa_legend_df$colours,
                   labels = lsoa_legend_df$labels,
@@ -624,22 +623,23 @@ shinyServer(function(input, output, session){
     input$map_base
     region$current
 
-    addTiles(leafletProxy("map"), urlTemplate = map_tile_url(),
+    leafletProxy("map") %>% addTiles(., urlTemplate = map_tile_url(), layerId = "background",
              attribution = '<a target="_blank" href="http://shiny.rstudio.com/">Shiny</a> |
              Routing <a target="_blank" href ="https://www.cyclestreets.net">CycleStreets</a> |
              Map &copy <a target="_blank" href ="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
              options=tileOptions(opacity = ifelse(input$map_base == "IMD", 0.3, 1),
-                                 minZoom = 7,
-                                 maxZoom = ifelse(input$map_base == "IMD", 14, 18), reuseTiles = T)) %>%
-                                 {
-                                   if (input$map_base == 'IMD'){
-                                     addTiles(leafletProxy("map"), urlTemplate = "http://tiles.oobrien.com/shine_urbanmask_dark/{z}/{x}/{y}.png",
-                                              options=tileOptions(opacity = 0.3, minZoom = 7, maxZoom = 14, reuseTiles = T))
-                                     addTiles(leafletProxy("map"), urlTemplate = "http://tiles.oobrien.com/shine_labels_cdrc/{z}/{x}/{y}.png",
-                                              options=tileOptions(opacity = 0.3, minZoom = 7, maxZoom = 14, reuseTiles = T))
-                                   }else .
-                                 }
-
+                                 minZoom = 7, reuseTiles = T, maxZoom = 18,
+                                 maxNativeZoom = ifelse(input$map_base == "IMD", 14, 18))) %>%
+      clearGroup(., "imd_background")
+    if (input$map_base == 'IMD'){
+      imdTileOptions <- tileOptions(opacity = 0.3, minZoom = 7, maxNativeZoom = 14, reuseTiles = T)
+      leafletProxy("map") %>%
+        addTiles(., urlTemplate = "http://tiles.oobrien.com/shine_urbanmask_dark/{z}/{x}/{y}.png", group = "imd_background",
+                 options=imdTileOptions) %>%
+        addTiles(., urlTemplate = "http://tiles.oobrien.com/shine_labels_cdrc/{z}/{x}/{y}.png", group = "imd_background",
+                 options=imdTileOptions)
+    }
+    leafletProxy("map") %>% hideGroup(., "lsoa_base_map") %>% showGroup(., "lsoa_base_map")
   })
 
   # Adds map legend
